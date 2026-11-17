@@ -3,6 +3,7 @@
 import {
   ChangeEvent,
   DragEvent,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -46,6 +47,76 @@ type IpSummary = {
   lastSeen: string;
   risk: RiskLevel;
   score: number;
+};
+
+type SecurityPolicy = {
+  highFailureThreshold: number;
+  mediumFailureThreshold: number;
+  rootAttemptThreshold: number;
+  trustedIps: string[];
+  trustedUsers: string[];
+};
+
+type HistorySnapshot = {
+  id: string;
+  createdAt: string;
+  sourceName: string;
+  total: number;
+  failed: number;
+  accepted: number;
+  suspicious: number;
+  uniqueIps: number;
+  blocked: number;
+};
+
+type BlockedIp = {
+  ip: string;
+  reason: string;
+  addedAt: string;
+  failed: number;
+  risk: RiskLevel;
+};
+
+type AlertSettings = {
+  browser: boolean;
+  emailAddress: string;
+  slackWebhook: string;
+  slackAutomatic: boolean;
+};
+
+type MonitorSettings = {
+  endpoint: string;
+  intervalSeconds: number;
+};
+
+type MonitorStatus = 'zatrzymany' | 'łączenie' | 'aktywny' | 'błąd';
+
+const DEFAULT_POLICY: SecurityPolicy = {
+  highFailureThreshold: 10,
+  mediumFailureThreshold: 5,
+  rootAttemptThreshold: 3,
+  trustedIps: [],
+  trustedUsers: [],
+};
+
+const DEFAULT_ALERT_SETTINGS: AlertSettings = {
+  browser: false,
+  emailAddress: '',
+  slackWebhook: '',
+  slackAutomatic: false,
+};
+
+const DEFAULT_MONITOR_SETTINGS: MonitorSettings = {
+  endpoint: 'http://127.0.0.1:8789/events',
+  intervalSeconds: 10,
+};
+
+const STORAGE_KEYS = {
+  history: 'system-guard-history-v1',
+  blocklist: 'system-guard-blocklist-v1',
+  policy: 'system-guard-policy-v1',
+  alerts: 'system-guard-alerts-v1',
+  monitor: 'system-guard-monitor-v1',
 };
 
 const SAMPLE_LOG = [
@@ -224,12 +295,27 @@ function parseAuthLog(content: string): AuthEvent[] {
     });
 }
 
-function calculateRisk(summary: Omit<IpSummary, 'risk' | 'score'>) {
-  const broadTargeting = summary.failed >= 5 && summary.users.length >= 3;
+function calculateRisk(
+  summary: Omit<IpSummary, 'risk' | 'score'>,
+  policy: SecurityPolicy,
+  trusted: boolean,
+) {
+  if (trusted) {
+    return { score: 0, risk: 'Niskie' as const };
+  }
+
+  const broadTargeting =
+    summary.failed >= policy.mediumFailureThreshold && summary.users.length >= 3;
   const score =
-    (summary.failed >= 10 ? 5 : summary.failed >= 5 ? 3 : summary.failed >= 3 ? 1 : 0) +
+    (summary.failed >= policy.highFailureThreshold
+      ? 5
+      : summary.failed >= policy.mediumFailureThreshold
+        ? 3
+        : summary.failed >= Math.max(1, policy.mediumFailureThreshold - 2)
+          ? 1
+          : 0) +
     (summary.invalidUsers >= 4 ? 3 : summary.invalidUsers >= 2 ? 1 : 0) +
-    (summary.rootAttempts >= 3 ? 2 : 0) +
+    (summary.rootAttempts >= policy.rootAttemptThreshold ? 2 : 0) +
     (broadTargeting ? 2 : 0);
 
   return {
@@ -243,7 +329,13 @@ function calculateRisk(summary: Omit<IpSummary, 'risk' | 'score'>) {
   };
 }
 
-function makeIpSummaries(events: AuthEvent[]): IpSummary[] {
+function makeIpSummaries(
+  events: AuthEvent[],
+  policy: SecurityPolicy = DEFAULT_POLICY,
+): IpSummary[] {
+  const trustedIps = new Set(
+    policy.trustedIps.map((ip) => ip.trim().toLowerCase()).filter(Boolean),
+  );
   const summaries = new Map<
     string,
     Omit<IpSummary, 'risk' | 'score'> & { userSet: Set<string> }
@@ -279,7 +371,8 @@ function makeIpSummaries(events: AuthEvent[]): IpSummary[] {
   return [...summaries.values()]
     .map(({ userSet, ...summary }) => {
       const withUsers = { ...summary, users: [...userSet] };
-      return { ...withUsers, ...calculateRisk(withUsers) };
+      const trusted = trustedIps.has(withUsers.ip.toLowerCase());
+      return { ...withUsers, ...calculateRisk(withUsers, policy, trusted) };
     })
     .sort((first, second) => {
       return second.score - first.score || second.failed - first.failed || second.total - first.total;
@@ -299,6 +392,120 @@ function riskClass(risk: RiskLevel) {
 function csvValue(value?: string | number | boolean) {
   const output = value === undefined ? '' : String(value);
   return '"' + output.replaceAll('"', '""') + '"';
+}
+
+function escapeHtml(value?: string | number) {
+  const entities: Record<string, string> = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;',
+  };
+  return String(value ?? '').replace(/[&<>"']/g, (character) => entities[character]);
+}
+
+function downloadText(filename: string, content: string, type: string) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function createSnapshot(
+  events: AuthEvent[],
+  sourceName: string,
+  policy: SecurityPolicy,
+  blocked: number,
+): HistorySnapshot {
+  const summaries = makeIpSummaries(events, policy);
+  return {
+    id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+    createdAt: new Date().toISOString(),
+    sourceName,
+    total: events.length,
+    failed: events.filter((event) => event.eventType === 'failed').length,
+    accepted: events.filter((event) => event.eventType === 'accepted').length,
+    suspicious: summaries.filter((summary) => summary.risk !== 'Niskie').length,
+    uniqueIps: summaries.length,
+    blocked,
+  };
+}
+
+function formatSnapshotDate(value: string) {
+  return new Intl.DateTimeFormat('pl-PL', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value));
+}
+
+function makeReportHtml(
+  snapshot: HistorySnapshot,
+  summaries: IpSummary[],
+  blocklist: BlockedIp[],
+) {
+  const riskRows = summaries
+    .slice(0, 15)
+    .map((summary) => {
+      return (
+        '<tr><td>' +
+        escapeHtml(summary.ip) +
+        '</td><td>' +
+        summary.failed +
+        '</td><td>' +
+        summary.accepted +
+        '</td><td>' +
+        escapeHtml(summary.users.join(', ') || '—') +
+        '</td><td>' +
+        escapeHtml(summary.risk) +
+        '</td></tr>'
+      );
+    })
+    .join('');
+  const blockedRows = blocklist.length
+    ? blocklist
+        .map((entry) => {
+          return (
+            '<li><strong>' +
+            escapeHtml(entry.ip) +
+            '</strong> — ' +
+            escapeHtml(entry.reason) +
+            ' (' +
+            escapeHtml(formatSnapshotDate(entry.addedAt)) +
+            ')</li>'
+          );
+        })
+        .join('')
+    : '<li>Brak adresów na lokalnej liście blokad.</li>';
+
+  return [
+    '<!doctype html><html lang="pl"><head><meta charset="utf-8"><title>System Guard — raport SSH</title>',
+    '<style>body{font-family:Arial,sans-serif;color:#172033;margin:40px;line-height:1.45}h1{margin:0;color:#0b3555}h2{margin-top:34px;color:#0b3555}.lead{color:#536176}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{padding:9px 10px;border-bottom:1px solid #dce3eb;text-align:left;font-size:13px}th{background:#eef7fb}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:24px 0}.metric{border:1px solid #dce3eb;border-radius:10px;padding:14px}.metric b{display:block;font-size:25px;color:#0b3555}.muted{color:#637086;font-size:12px}@media print{body{margin:20px}.metrics{gap:8px}}</style></head><body>',
+    '<h1>System Guard — raport SSH</h1><p class="lead">Wygenerowano: ' +
+      escapeHtml(formatSnapshotDate(snapshot.createdAt)) +
+      ' · Źródło: ' +
+      escapeHtml(snapshot.sourceName) +
+      '</p>',
+    '<section class="metrics"><div class="metric"><span>Nieudane logowania</span><b>' +
+      snapshot.failed +
+      '</b></div><div class="metric"><span>Udane logowania</span><b>' +
+      snapshot.accepted +
+      '</b></div><div class="metric"><span>Podejrzane IP</span><b>' +
+      snapshot.suspicious +
+      '</b></div><div class="metric"><span>Unikalne IP</span><b>' +
+      snapshot.uniqueIps +
+      '</b></div></section>',
+    '<h2>Adresy wymagające uwagi</h2><table><thead><tr><th>Adres IP</th><th>Odrzucone</th><th>Udane</th><th>Cele</th><th>Ryzyko</th></tr></thead><tbody>' +
+      (riskRows || '<tr><td colspan="5">Brak danych.</td></tr>') +
+      '</tbody></table>',
+    '<h2>Lokalna lista blokad</h2><ul>' +
+      blockedRows +
+      '</ul><p class="muted">Raport nie wykonuje blokad automatycznie. Zweryfikuj adresy IP przed użyciem poleceń zapory.</p>',
+    '</body></html>',
+  ].join('');
 }
 
 function MetricCard({
@@ -328,6 +535,17 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [events, setEvents] = useState<AuthEvent[]>(() => parseAuthLog(SAMPLE_LOG));
   const [fileName, setFileName] = useState('Dane demonstracyjne');
+  const [policy, setPolicy] = useState<SecurityPolicy>(DEFAULT_POLICY);
+  const [history, setHistory] = useState<HistorySnapshot[]>([]);
+  const [blocklist, setBlocklist] = useState<BlockedIp[]>([]);
+  const [alertSettings, setAlertSettings] =
+    useState<AlertSettings>(DEFAULT_ALERT_SETTINGS);
+  const [monitorSettings, setMonitorSettings] =
+    useState<MonitorSettings>(DEFAULT_MONITOR_SETTINGS);
+  const [monitorEnabled, setMonitorEnabled] = useState(false);
+  const [monitorStatus, setMonitorStatus] =
+    useState<MonitorStatus>('zatrzymany');
+  const [storageReady, setStorageReady] = useState(false);
   const [query, setQuery] = useState('');
   const [eventFilter, setEventFilter] = useState<EventFilter>('all');
   const [riskFilter, setRiskFilter] = useState<RiskFilter>('all');
@@ -336,7 +554,156 @@ export default function Home() {
   const [notice, setNotice] = useState('');
   const [selectedIp, setSelectedIp] = useState<string | null>(null);
 
-  const ipSummaries = useMemo(() => makeIpSummaries(events), [events]);
+  useEffect(() => {
+    const restoreLocalState = () => {
+      try {
+        const storedHistory = localStorage.getItem(STORAGE_KEYS.history);
+        const storedBlocklist = localStorage.getItem(STORAGE_KEYS.blocklist);
+        const storedPolicy = localStorage.getItem(STORAGE_KEYS.policy);
+        const storedAlerts = localStorage.getItem(STORAGE_KEYS.alerts);
+        const storedMonitor = localStorage.getItem(STORAGE_KEYS.monitor);
+
+        if (storedHistory) setHistory(JSON.parse(storedHistory) as HistorySnapshot[]);
+        if (storedBlocklist) setBlocklist(JSON.parse(storedBlocklist) as BlockedIp[]);
+        if (storedPolicy) {
+          setPolicy((current) => ({
+            ...current,
+            ...(JSON.parse(storedPolicy) as Partial<SecurityPolicy>),
+          }));
+        }
+        if (storedAlerts) {
+          setAlertSettings((current) => ({
+            ...current,
+            ...(JSON.parse(storedAlerts) as Partial<AlertSettings>),
+            slackWebhook: '',
+          }));
+        }
+        if (storedMonitor) {
+          setMonitorSettings((current) => ({
+            ...current,
+            ...(JSON.parse(storedMonitor) as Partial<MonitorSettings>),
+          }));
+        }
+      } catch {
+        setError('Nie udało się odczytać części lokalnych ustawień. Możesz nadal korzystać z analizy.');
+      } finally {
+        setStorageReady(true);
+      }
+    };
+    const restoreTimer = window.setTimeout(restoreLocalState, 0);
+    return () => window.clearTimeout(restoreTimer);
+  }, []);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    localStorage.setItem(STORAGE_KEYS.history, JSON.stringify(history.slice(0, 90)));
+  }, [history, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    localStorage.setItem(STORAGE_KEYS.blocklist, JSON.stringify(blocklist));
+  }, [blocklist, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    localStorage.setItem(STORAGE_KEYS.policy, JSON.stringify(policy));
+  }, [policy, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    localStorage.setItem(
+      STORAGE_KEYS.alerts,
+      JSON.stringify({
+        browser: alertSettings.browser,
+        emailAddress: alertSettings.emailAddress,
+        slackAutomatic: alertSettings.slackAutomatic,
+      }),
+    );
+  }, [
+    alertSettings.browser,
+    alertSettings.emailAddress,
+    alertSettings.slackAutomatic,
+    storageReady,
+  ]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    localStorage.setItem(STORAGE_KEYS.monitor, JSON.stringify(monitorSettings));
+  }, [monitorSettings, storageReady]);
+
+  useEffect(() => {
+    if (!monitorEnabled) {
+      return;
+    }
+
+    const endpoint = monitorSettings.endpoint.trim();
+    if (!endpoint) {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        setMonitorStatus('łączenie');
+        const response = await fetch(endpoint, { cache: 'no-store' });
+        if (!response.ok) throw new Error('Monitor zwrócił błąd');
+        const payload = (await response.json()) as { lines?: unknown };
+        const lines = Array.isArray(payload.lines)
+          ? payload.lines.filter((line): line is string => typeof line === 'string')
+          : [];
+
+        if (cancelled) return;
+        setMonitorStatus('aktywny');
+        if (!lines.length) return;
+
+        const batchId = Date.now().toString(36);
+        const appended = parseAuthLog(lines.join('\n'))
+          .filter((event) => event.eventType !== 'unknown')
+          .map((event, index) => ({
+            ...event,
+            id: 'live-' + batchId + '-' + index + '-' + event.rawLine,
+          }));
+        if (!appended.length) return;
+
+        setEvents((current) => [...current, ...appended].slice(-5000));
+        setFileName('Monitor lokalny');
+        setNotice('Monitor dodał ' + appended.length + ' nowych zdarzeń SSH.');
+
+        if (
+          alertSettings.browser &&
+          'Notification' in window &&
+          Notification.permission === 'granted' &&
+          appended.some((event) => event.eventType === 'failed')
+        ) {
+          new Notification('System Guard: nowe zdarzenia SSH', {
+            body: 'Dodano ' + appended.length + ' wpisów z lokalnego monitora.',
+          });
+        }
+      } catch {
+        if (!cancelled) setMonitorStatus('błąd');
+      }
+    };
+
+    void poll();
+    const interval = window.setInterval(
+      () => void poll(),
+      Math.max(3, monitorSettings.intervalSeconds) * 1000,
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    alertSettings.browser,
+    monitorEnabled,
+    monitorSettings.endpoint,
+    monitorSettings.intervalSeconds,
+  ]);
+
+  const ipSummaries = useMemo(
+    () => makeIpSummaries(events, policy),
+    [events, policy],
+  );
   const riskByIp = useMemo(
     () => new Map(ipSummaries.map((summary) => [summary.ip, summary.risk])),
     [ipSummaries],
@@ -352,7 +719,13 @@ export default function Home() {
         .filter(Boolean),
     ).size;
     const suspicious = ipSummaries.filter((summary) => summary.risk !== 'Niskie').length;
-    return { failed, accepted, invalidUsers, suspicious };
+    return {
+      failed,
+      accepted,
+      invalidUsers,
+      suspicious,
+      uniqueIps: ipSummaries.length,
+    };
   }, [events, ipSummaries]);
 
   const timeline = useMemo(() => {
@@ -403,10 +776,52 @@ export default function Home() {
   const selectedEvents = selectedIp
     ? events.filter((event) => event.sourceIp === selectedIp)
     : [];
+  const previousSnapshot = history.length > 1 ? history[1] : undefined;
+  const latestSnapshot = history[0];
+  const currentMonitorStatus: MonitorStatus = !monitorEnabled
+    ? 'zatrzymany'
+    : !monitorSettings.endpoint.trim()
+      ? 'błąd'
+      : monitorStatus;
 
   function showNotice(message: string, timeout = 4000) {
     setNotice(message);
     window.setTimeout(() => setNotice(''), timeout);
+  }
+
+  function saveSnapshot(analyzedEvents: AuthEvent[], sourceName: string) {
+    const snapshot = createSnapshot(
+      analyzedEvents,
+      sourceName,
+      policy,
+      blocklist.length,
+    );
+    setHistory((current) => [snapshot, ...current].slice(0, 90));
+    return snapshot;
+  }
+
+  function notifyAboutHighRisk(
+    summaries: IpSummary[],
+    sourceName: string,
+  ) {
+    const highRisk = summaries.filter((summary) => summary.risk === 'Wysokie');
+    if (!highRisk.length) return;
+    if (
+      alertSettings.browser &&
+      'Notification' in window &&
+      Notification.permission === 'granted'
+    ) {
+      new Notification('System Guard: wysokie ryzyko', {
+        body:
+          sourceName +
+          ': wykryto ' +
+          highRisk.length +
+          ' adres(y) IP o wysokim ryzyku.',
+      });
+    }
+    if (alertSettings.slackAutomatic && alertSettings.slackWebhook.trim()) {
+      void sendSlackAlert(sourceName, highRisk, false);
+    }
   }
 
   function analyzeText(content: string, name: string) {
@@ -427,6 +842,9 @@ export default function Home() {
     setFileName(name);
     setError('');
     setSelectedIp(null);
+    const summaries = makeIpSummaries(parsed, policy);
+    saveSnapshot(parsed, name);
+    notifyAboutHighRisk(summaries, name);
     showNotice('Przeanalizowano ' + parsed.length + ' wpisów, z czego ' + recognized + ' rozpoznano jako zdarzenia SSH.', 5000);
   }
 
@@ -494,6 +912,165 @@ export default function Home() {
     anchor.click();
     URL.revokeObjectURL(url);
     showNotice('Pobrano raport CSV z aktualnie widocznymi zdarzeniami.');
+  }
+
+  function exportHtmlReport() {
+    const snapshot = createSnapshot(events, fileName, policy, blocklist.length);
+    const html = makeReportHtml(snapshot, ipSummaries, blocklist);
+    downloadText(
+      'system-guard-ssh-report.html',
+      html,
+      'text/html;charset=utf-8',
+    );
+    showNotice('Pobrano samodzielny raport HTML.');
+  }
+
+  function printPdfReport() {
+    const snapshot = createSnapshot(events, fileName, policy, blocklist.length);
+    const reportWindow = window.open('', '_blank');
+    if (!reportWindow) {
+      showNotice('Przeglądarka zablokowała okno raportu. Zezwól na wyskakujące okna i spróbuj ponownie.');
+      return;
+    }
+    reportWindow.opener = null;
+    reportWindow.document.open();
+    reportWindow.document.write(makeReportHtml(snapshot, ipSummaries, blocklist));
+    reportWindow.document.close();
+    reportWindow.focus();
+    window.setTimeout(() => reportWindow.print(), 250);
+  }
+
+  function addToBlocklist(summary: IpSummary) {
+    if (blocklist.some((entry) => entry.ip === summary.ip)) {
+      showNotice('Ten adres IP jest już na lokalnej liście blokad.');
+      return;
+    }
+    setBlocklist((current) => [
+      {
+        ip: summary.ip,
+        reason:
+          summary.risk +
+          ' ryzyko · ' +
+          summary.failed +
+          ' odrzuconych prób',
+        addedAt: new Date().toISOString(),
+        failed: summary.failed,
+        risk: summary.risk,
+      },
+      ...current,
+    ]);
+    showNotice('Dodano ' + summary.ip + ' do lokalnej listy blokad. Żadna zapora nie została zmieniona automatycznie.');
+  }
+
+  function removeFromBlocklist(ip: string) {
+    setBlocklist((current) => current.filter((entry) => entry.ip !== ip));
+    showNotice('Usunięto ' + ip + ' z lokalnej listy blokad.');
+  }
+
+  function exportFail2ban() {
+    if (!blocklist.length) {
+      showNotice('Lista blokad jest pusta. Najpierw dodaj adres IP z poziomu szczegółów.');
+      return;
+    }
+    const commands = [
+      '#!/usr/bin/env bash',
+      '# Wygenerowano przez System Guard. Zweryfikuj adresy przed uruchomieniem.',
+      'set -euo pipefail',
+      '',
+      ...blocklist.map(
+        (entry) => 'sudo fail2ban-client set sshd banip ' + entry.ip,
+      ),
+      '',
+    ].join('\n');
+    downloadText(
+      'system-guard-fail2ban-banip.sh',
+      commands,
+      'text/x-shellscript;charset=utf-8',
+    );
+    showNotice('Pobrano skrypt Fail2ban. Nie został automatycznie uruchomiony.');
+  }
+
+  async function enableBrowserAlerts() {
+    if (!('Notification' in window)) {
+      showNotice('Ta przeglądarka nie obsługuje powiadomień systemowych.');
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    const enabled = permission === 'granted';
+    setAlertSettings((current) => ({ ...current, browser: enabled }));
+    showNotice(
+      enabled
+        ? 'Powiadomienia systemowe są włączone.'
+        : 'Nie przyznano zgody na powiadomienia systemowe.',
+    );
+  }
+
+  function composeEmailAlert() {
+    const recipient = alertSettings.emailAddress.trim();
+    if (!recipient) {
+      showNotice('Wpisz adres e-mail w ustawieniach alertów.');
+      return;
+    }
+    const highRisk = ipSummaries.filter((summary) => summary.risk === 'Wysokie');
+    const subject = encodeURIComponent(
+      'System Guard: ' + highRisk.length + ' adres(y) IP o wysokim ryzyku',
+    );
+    const body = encodeURIComponent(
+      [
+        'Raport System Guard',
+        '',
+        'Źródło: ' + fileName,
+        'Nieudane logowania: ' + metrics.failed,
+        'Podejrzane IP: ' + metrics.suspicious,
+        'Adresy wysokiego ryzyka: ' +
+          (highRisk.map((summary) => summary.ip).join(', ') || 'brak'),
+      ].join('\n'),
+    );
+    window.location.href =
+      'mailto:' + encodeURIComponent(recipient) + '?subject=' + subject + '&body=' + body;
+  }
+
+  async function sendSlackAlert(
+    sourceName: string,
+    highRisk: IpSummary[],
+    showFeedback: boolean,
+  ) {
+    const webhook = alertSettings.slackWebhook.trim();
+    if (!webhook) {
+      if (showFeedback) {
+        showNotice('Wpisz adres webhooka Slack. Jest przechowywany tylko do końca bieżącej sesji.');
+      }
+      return;
+    }
+    try {
+      await fetch(webhook, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+        body: JSON.stringify({
+          text:
+            'System Guard — alert SSH\nŹródło: ' +
+            sourceName +
+            '\nWysokie ryzyko: ' +
+            (highRisk.map((summary) => summary.ip).join(', ') || 'brak'),
+        }),
+      });
+      if (showFeedback) {
+        showNotice('Wysłano żądanie testowego alertu do Slacka. Przeglądarka nie może potwierdzić dostarczenia odpowiedzi.');
+      }
+    } catch {
+      if (showFeedback) {
+        showNotice('Nie udało się wysłać żądania do Slacka. Sprawdź adres webhooka oraz połączenie sieciowe.');
+      }
+    }
+  }
+
+  async function sendSlackTest() {
+    await sendSlackAlert(
+      'test ręczny',
+      ipSummaries.filter((summary) => summary.risk === 'Wysokie'),
+      true,
+    );
   }
 
   async function copyFirewallRules() {
@@ -613,6 +1190,229 @@ export default function Home() {
           <MetricCard label="Rozpoznane obce konta" value={metrics.invalidUsers} detail="Nazwy kont widoczne w próbach" accent="bg-cyan-300" />
         </section>
 
+        <section className="mt-6 grid gap-6 xl:grid-cols-2">
+          <article className="rounded-2xl border border-white/8 bg-white/[0.035] p-5 sm:p-6">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <p className="text-sm font-semibold text-white">Raport dla zespołu</p>
+                <p className="mt-1 text-sm leading-6 text-slate-500">Pobierz samodzielny raport HTML albo otwórz wersję gotową do zapisania jako PDF.</p>
+              </div>
+              <span className="w-fit rounded-full border border-cyan-300/15 bg-cyan-300/8 px-2.5 py-1 text-[11px] text-cyan-100">bez danych poza przeglądarką</span>
+            </div>
+            <div className="mt-5 flex flex-wrap gap-3">
+              <button type="button" onClick={exportHtmlReport} className="rounded-xl border border-white/10 bg-white/[0.045] px-4 py-2.5 text-sm font-medium text-white transition hover:border-cyan-300/40 hover:bg-cyan-300/10">
+                Pobierz HTML
+              </button>
+              <button type="button" onClick={printPdfReport} className="rounded-xl bg-cyan-200 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-white">
+                Drukuj / zapisz PDF
+              </button>
+            </div>
+            <p className="mt-4 text-xs leading-5 text-slate-500">Raport zawiera podsumowanie, ranking adresów IP oraz lokalną listę blokad — bez pełnej treści surowych logów.</p>
+          </article>
+
+          <article className="rounded-2xl border border-white/8 bg-white/[0.035] p-5 sm:p-6">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-white">Historia i porównanie</p>
+                <p className="mt-1 text-sm leading-6 text-slate-500">Zapamiętywane są wyłącznie statystyki analiz na tym urządzeniu, a nie pełne logi.</p>
+              </div>
+              <span className="rounded-full bg-white/6 px-2.5 py-1 text-[11px] text-slate-400">{history.length} zapisów</span>
+            </div>
+
+            {latestSnapshot ? (
+              <div className="mt-5">
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                  <div className="rounded-xl bg-black/15 p-3"><p className="text-[11px] text-slate-500">Odrzucone</p><p className="mt-1 text-lg font-semibold text-rose-200">{latestSnapshot.failed}</p></div>
+                  <div className="rounded-xl bg-black/15 p-3"><p className="text-[11px] text-slate-500">Podejrzane IP</p><p className="mt-1 text-lg font-semibold text-amber-100">{latestSnapshot.suspicious}</p></div>
+                  <div className="rounded-xl bg-black/15 p-3"><p className="text-[11px] text-slate-500">Unikalne IP</p><p className="mt-1 text-lg font-semibold text-white">{latestSnapshot.uniqueIps}</p></div>
+                  <div className="rounded-xl bg-black/15 p-3"><p className="text-[11px] text-slate-500">Zablokowane</p><p className="mt-1 text-lg font-semibold text-cyan-100">{latestSnapshot.blocked}</p></div>
+                </div>
+                {previousSnapshot ? (
+                  <p className="mt-4 rounded-lg border border-white/8 bg-white/[0.025] px-3 py-2.5 text-xs leading-5 text-slate-400">
+                    W porównaniu z poprzednią analizą: nieudane logowania {latestSnapshot.failed - previousSnapshot.failed >= 0 ? '+' : ''}{latestSnapshot.failed - previousSnapshot.failed}, podejrzane IP {latestSnapshot.suspicious - previousSnapshot.suspicious >= 0 ? '+' : ''}{latestSnapshot.suspicious - previousSnapshot.suspicious}. Poprzednia analiza: {formatSnapshotDate(previousSnapshot.createdAt)}.
+                  </p>
+                ) : (
+                  <p className="mt-4 text-xs leading-5 text-slate-500">Wczytaj kolejny plik w innym dniu, aby zobaczyć porównanie trendu.</p>
+                )}
+                <div className="mt-4 max-h-28 space-y-1.5 overflow-auto pr-1">
+                  {history.slice(0, 4).map((snapshot) => (
+                    <div key={snapshot.id} className="flex items-center justify-between gap-3 text-xs text-slate-500">
+                      <span className="truncate">{formatSnapshotDate(snapshot.createdAt)} · {snapshot.sourceName}</span>
+                      <span className="shrink-0 text-slate-300">{snapshot.failed} błędów</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-5 rounded-xl border border-dashed border-white/10 px-4 py-5 text-sm leading-6 text-slate-500">
+                Pierwszy wpis historii zostanie utworzony po wczytaniu własnego pliku logów.
+              </div>
+            )}
+          </article>
+        </section>
+
+        <section className="mt-6 grid gap-6 xl:grid-cols-2">
+          <article className="rounded-2xl border border-white/8 bg-white/[0.035] p-5 sm:p-6">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <p className="text-sm font-semibold text-white">Lokalna lista blokad</p>
+                <p className="mt-1 text-sm leading-6 text-slate-500">Dodanie adresu nie zmienia zapory. Gdy lista będzie gotowa, pobierz bezpieczny skrypt do ręcznej weryfikacji i użycia w Fail2ban.</p>
+              </div>
+              <button type="button" onClick={exportFail2ban} className="shrink-0 rounded-xl border border-rose-300/20 bg-rose-300/8 px-3 py-2 text-xs font-medium text-rose-100 transition hover:bg-rose-300/15">
+                Eksport Fail2ban
+              </button>
+            </div>
+            <div className="mt-5 space-y-2">
+              {blocklist.length ? blocklist.slice(0, 5).map((entry) => (
+                <div key={entry.ip} className="flex items-center gap-3 rounded-xl border border-white/8 bg-black/15 px-3 py-3">
+                  <span className="h-2 w-2 rounded-full bg-rose-300" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate font-mono text-sm text-white">{entry.ip}</span>
+                    <span className="mt-0.5 block truncate text-xs text-slate-500">{entry.reason}</span>
+                  </span>
+                  <button type="button" onClick={() => removeFromBlocklist(entry.ip)} className="text-xs text-slate-400 underline decoration-slate-600 underline-offset-4 hover:text-white">
+                    Usuń
+                  </button>
+                </div>
+              )) : (
+                <div className="rounded-xl border border-dashed border-white/10 px-4 py-5 text-sm leading-6 text-slate-500">
+                  Lista jest pusta. Otwórz szczegóły adresu IP z rankingu i dodaj go po weryfikacji.
+                </div>
+              )}
+            </div>
+          </article>
+
+          <article className="rounded-2xl border border-white/8 bg-white/[0.035] p-5 sm:p-6">
+            <div>
+              <p className="text-sm font-semibold text-white">Powiadomienia</p>
+              <p className="mt-1 text-sm leading-6 text-slate-500">Powiadomienia systemowe działają automatycznie po wykryciu wysokiego ryzyka. Slack można włączyć dopiero po podaniu webhooka i wyrażeniu zgody.</p>
+            </div>
+            <div className="mt-5 grid gap-3 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center">
+              <button type="button" onClick={enableBrowserAlerts} className="rounded-xl border border-cyan-300/20 bg-cyan-300/8 px-3 py-2.5 text-sm font-medium text-cyan-100 transition hover:bg-cyan-300/15">
+                {alertSettings.browser ? 'Powiadomienia włączone' : 'Włącz powiadomienia'}
+              </button>
+              <p className="text-xs leading-5 text-slate-500">Stan: {alertSettings.browser ? 'aktywny' : 'wyłączony lub bez zgody przeglądarki'}.</p>
+            </div>
+            <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <input
+                value={alertSettings.emailAddress}
+                onChange={(event) => setAlertSettings((current) => ({ ...current, emailAddress: event.target.value }))}
+                type="email"
+                placeholder="adres@firma.pl"
+                aria-label="Adres e-mail dla alertu"
+                className="min-w-0 rounded-xl border border-white/10 bg-black/15 px-3 py-2.5 text-sm text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50"
+              />
+              <button type="button" onClick={composeEmailAlert} className="rounded-xl border border-white/10 px-3 py-2.5 text-sm text-slate-200 transition hover:border-cyan-300/35 hover:text-white">
+                Utwórz e-mail
+              </button>
+            </div>
+            <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <input
+                value={alertSettings.slackWebhook}
+                onChange={(event) => setAlertSettings((current) => ({ ...current, slackWebhook: event.target.value }))}
+                type="url"
+                placeholder="https://hooks.slack.com/services/..."
+                aria-label="Adres webhooka Slack"
+                className="min-w-0 rounded-xl border border-white/10 bg-black/15 px-3 py-2.5 text-sm text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50"
+              />
+              <button type="button" onClick={sendSlackTest} className="rounded-xl border border-white/10 px-3 py-2.5 text-sm text-slate-200 transition hover:border-cyan-300/35 hover:text-white">
+                Test Slack
+              </button>
+            </div>
+            <label className="mt-3 flex items-start gap-3 rounded-xl border border-white/8 bg-black/15 px-3 py-3 text-xs leading-5 text-slate-400">
+              <input
+                type="checkbox"
+                checked={alertSettings.slackAutomatic}
+                onChange={(event) => setAlertSettings((current) => ({ ...current, slackAutomatic: event.target.checked }))}
+                className="mt-0.5 h-4 w-4 accent-cyan-300"
+              />
+              <span>Wysyłaj alert Slack przy wykryciu wysokiego ryzyka. Adres webhooka musi pozostać wpisany w tej sesji.</span>
+            </label>
+            <p className="mt-3 text-xs leading-5 text-slate-500">Adres Slacka nie jest zapisywany w historii ani w plikach projektu — znika po zamknięciu bieżącej sesji.</p>
+          </article>
+        </section>
+
+        <section className="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1.1fr)_minmax(360px,0.9fr)]">
+          <article className="rounded-2xl border border-white/8 bg-white/[0.035] p-5 sm:p-6">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <p className="text-sm font-semibold text-white">Monitor na żywo</p>
+                <p className="mt-1 text-sm leading-6 text-slate-500">Połącz panel z dołączonym lokalnym agentem, który nasłuchuje zmian w <code className="rounded bg-white/7 px-1 text-slate-300">/var/log/auth.log</code>. Agent działa wyłącznie na <code className="rounded bg-white/7 px-1 text-slate-300">127.0.0.1</code>.</p>
+              </div>
+              <span className={['w-fit rounded-full border px-2.5 py-1 text-[11px] ', currentMonitorStatus === 'aktywny' ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-100' : currentMonitorStatus === 'błąd' ? 'border-rose-400/20 bg-rose-400/10 text-rose-100' : 'border-white/10 bg-white/5 text-slate-400'].join(' ')}>
+                {currentMonitorStatus}
+              </span>
+            </div>
+            <div className="mt-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_120px]">
+              <input
+                value={monitorSettings.endpoint}
+                onChange={(event) => setMonitorSettings((current) => ({ ...current, endpoint: event.target.value }))}
+                aria-label="Adres lokalnego monitora"
+                className="min-w-0 rounded-xl border border-white/10 bg-black/15 px-3 py-2.5 font-mono text-sm text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50"
+              />
+              <label className="rounded-xl border border-white/10 bg-black/15 px-3 py-2 text-xs text-slate-500">
+                co ile sekund
+                <input
+                  type="number"
+                  min="3"
+                  max="300"
+                  value={monitorSettings.intervalSeconds}
+                  onChange={(event) => setMonitorSettings((current) => ({ ...current, intervalSeconds: Math.max(3, Number(event.target.value) || 3)}))}
+                  className="mt-1 w-full bg-transparent text-sm text-white outline-none"
+                />
+              </label>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-3">
+              <button type="button" onClick={() => { setMonitorStatus('łączenie'); setMonitorEnabled(true); }} disabled={monitorEnabled} className="rounded-xl bg-cyan-200 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-50">
+                Uruchom odczyt
+              </button>
+              <button type="button" onClick={() => { setMonitorEnabled(false); setMonitorStatus('zatrzymany'); }} disabled={!monitorEnabled} className="rounded-xl border border-white/10 px-4 py-2.5 text-sm text-slate-300 transition hover:border-white/25 hover:text-white disabled:cursor-not-allowed disabled:opacity-50">
+                Zatrzymaj
+              </button>
+            </div>
+            <p className="mt-4 text-xs leading-5 text-slate-500">W repozytorium znajduje się skrypt <code className="text-slate-300">scripts/ssh-monitor.mjs</code>. W trybie monitorowania nie wysyłamy logów na zewnętrzny serwer.</p>
+          </article>
+
+          <article className="rounded-2xl border border-white/8 bg-white/[0.035] p-5 sm:p-6">
+            <div>
+              <p className="text-sm font-semibold text-white">Polityka bezpieczeństwa</p>
+              <p className="mt-1 text-sm leading-6 text-slate-500">Dopasuj ocenę ryzyka do charakteru swojego serwera. Zaufane IP są wyłączone z alarmów.</p>
+            </div>
+            <div className="mt-5 grid grid-cols-3 gap-3">
+              <label className="rounded-xl border border-white/10 bg-black/15 px-3 py-2 text-[11px] text-slate-500">
+                wysokie od
+                <input type="number" min="1" value={policy.highFailureThreshold} onChange={(event) => setPolicy((current) => ({ ...current, highFailureThreshold: Math.max(1, Number(event.target.value) || 1)}))} className="mt-1 w-full bg-transparent text-sm text-white outline-none" />
+              </label>
+              <label className="rounded-xl border border-white/10 bg-black/15 px-3 py-2 text-[11px] text-slate-500">
+                średnie od
+                <input type="number" min="1" value={policy.mediumFailureThreshold} onChange={(event) => setPolicy((current) => ({ ...current, mediumFailureThreshold: Math.max(1, Number(event.target.value) || 1)}))} className="mt-1 w-full bg-transparent text-sm text-white outline-none" />
+              </label>
+              <label className="rounded-xl border border-white/10 bg-black/15 px-3 py-2 text-[11px] text-slate-500">
+                próby root
+                <input type="number" min="1" value={policy.rootAttemptThreshold} onChange={(event) => setPolicy((current) => ({ ...current, rootAttemptThreshold: Math.max(1, Number(event.target.value) || 1)}))} className="mt-1 w-full bg-transparent text-sm text-white outline-none" />
+              </label>
+            </div>
+            <label className="mt-3 block text-xs text-slate-500">
+              Zaufane adresy IP — po jednym w wierszu lub po przecinku
+              <textarea
+                value={policy.trustedIps.join('\n')}
+                onChange={(event) => setPolicy((current) => ({ ...current, trustedIps: event.target.value.split(/[\n,]/).map((ip) => ip.trim()).filter(Boolean) }))}
+                placeholder="203.0.113.10"
+                className="mt-1.5 min-h-20 w-full rounded-xl border border-white/10 bg-black/15 px-3 py-2.5 font-mono text-sm text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50"
+              />
+            </label>
+            <label className="mt-3 block text-xs text-slate-500">
+              Oczekiwani użytkownicy — wyłącznie do dokumentacji polityki
+              <textarea
+                value={policy.trustedUsers.join('\n')}
+                onChange={(event) => setPolicy((current) => ({ ...current, trustedUsers: event.target.value.split(/[\n,]/).map((user) => user.trim()).filter(Boolean) }))}
+                placeholder="deploy, admin"
+                className="mt-1.5 min-h-16 w-full rounded-xl border border-white/10 bg-black/15 px-3 py-2.5 text-sm text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50"
+              />
+            </label>
+          </article>
+        </section>
+
         <section className="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1.65fr)_minmax(340px,0.85fr)]">
           <article className="rounded-2xl border border-white/8 bg-white/[0.035] p-5 sm:p-6">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -711,9 +1511,21 @@ export default function Home() {
                   Pierwszy wpis: {selectedSummary.firstSeen}. Ostatni wpis: {selectedSummary.lastSeen}. Cele: {selectedSummary.users.join(', ') || 'brak rozpoznanego konta'}.
                 </p>
               </div>
-              <button type="button" onClick={() => setSelectedIp(null)} className="self-start text-sm text-cyan-100 underline decoration-cyan-300/40 underline-offset-4 hover:text-white">
-                Zamknij szczegóły
-              </button>
+              <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={() => addToBlocklist(selectedSummary)}
+                  disabled={blocklist.some((entry) => entry.ip === selectedSummary.ip)}
+                  className="self-start rounded-xl border border-rose-300/20 bg-rose-300/8 px-3 py-2 text-xs font-medium text-rose-100 transition hover:bg-rose-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {blocklist.some((entry) => entry.ip === selectedSummary.ip)
+                    ? 'Już na liście blokad'
+                    : 'Dodaj do listy blokad'}
+                </button>
+                <button type="button" onClick={() => setSelectedIp(null)} className="self-start text-sm text-cyan-100 underline decoration-cyan-300/40 underline-offset-4 hover:text-white">
+                  Zamknij szczegóły
+                </button>
+              </div>
             </div>
             <div className="mt-5 grid gap-3 sm:grid-cols-4">
               <div className="rounded-xl bg-black/15 p-3"><p className="text-xs text-slate-500">Wszystkie zdarzenia</p><p className="mt-1 text-xl font-semibold text-white">{selectedSummary.total}</p></div>

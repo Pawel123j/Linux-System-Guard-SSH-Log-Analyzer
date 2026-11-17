@@ -37,3 +37,45 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# GITHUB-UPLOADER-RULES
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+id_rsa
+id_ed25519
+credentials.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node.js
+node_modules/
+.next/
+dist/
+coverage/
+
+# Unity
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# IDE and system
+.vs/
+.idea/
+Thumbs.db
+.DS_Store
