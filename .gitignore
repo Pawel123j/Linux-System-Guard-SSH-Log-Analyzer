@@ -79,3 +79,6 @@ coverage/
 .idea/
 Thumbs.db
 .DS_Store
+
+# TypeScript incremental cache (lokalny, nieaktualny cache dawał fałszywe błędy typów)
+*.tsbuildinfo
