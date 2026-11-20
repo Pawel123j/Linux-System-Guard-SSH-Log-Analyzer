@@ -32,8 +32,24 @@ Do lokalnego testu możesz użyć przykładowego pliku:
 pnpm monitor -- --file fixtures/ssh-auth.log --from-start
 ~~~
 
+Monitor odpowiada tylko stronom z lokalnego adresu (`http://localhost:*`, `http://127.0.0.1:*`). Jeśli panel jest hostowany pod innym adresem, dopisz go jawnie:
+
+```bash
+pnpm monitor -- --file /var/log/auth.log --allow-origin https://twoj-panel.example
+```
+
+Żądania z innych stron dostają 403, a żądania z obcym nagłówkiem `Host` (DNS rebinding) dostają 421. Dzięki temu dowolna otwarta w przeglądarce strona nie odczyta adresów IP i nazw kont z logu.
+
 Agent nie zmienia pliku logu, nie wykonuje poleceń zapory i nie otwiera portu w sieci — nasłuchuje wyłącznie na lokalnym adresie loopback.
 
 ## Fail2ban
 
 Dodaj zweryfikowane adresy IP do lokalnej listy blokad, a następnie pobierz skrypt z poleceniami fail2ban-client set sshd banip. Przed uruchomieniem sprawdź wygenerowaną listę i upewnij się, że nazwa jaila sshd pasuje do konfiguracji serwera.
+
+## Testy
+
+```bash
+pnpm test   # testy monitora (node:test): CORS, DNS rebinding, odczyt sshd
+pnpm lint
+pnpm build
+```

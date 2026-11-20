@@ -2,15 +2,20 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -27,4 +32,5 @@ jobs:
       - run: pnpm audit --audit-level high
       - run: pnpm lint
       - run: pnpm exec tsc --noEmit --incremental false
+      - run: pnpm test
       - run: pnpm build
